@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# vsopen: open files in your code-server window from any shell on the server, such as ssh, a cron job or an AI
+# agent's shell tool. Usage: vsopen <file> [more files...]
+#
+# code-server's remote CLI opens files in a window when VSCODE_IPC_HOOK_CLI names that window's socket, and only the
+# window's own terminals have it set. vsopen finds the sockets and tries them newest first. A closed window leaves its
+# socket behind and refuses the connection, so vsopen moves on to the next one.
+set -euo pipefail
+
+usage="usage: vsopen <file> [more files...]"
+case "${1-}" in
+  -h|--help) echo "$usage"; exit 0 ;;
+  "") echo "$usage" >&2; exit 2 ;;
+esac
+
+dirs=("${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" "${TMPDIR:-/tmp}")
+# Read the whole list: `ls -t | head -1` dies of SIGPIPE under pipefail once there are enough stale sockets.
+mapfile -t socks < <(ls -t "${dirs[0]}"/vscode-ipc-*.sock "${dirs[1]}"/vscode-ipc-*.sock 2>/dev/null || true)
+if [ "${#socks[@]}" -eq 0 ]; then
+  echo "vsopen: no window sockets (vscode-ipc-*.sock) in ${dirs[0]} or ${dirs[1]}; is a code-server window open?" >&2
+  exit 1
+fi
+
+find_cli() {
+  local c d bin cands=()
+  if [ -n "${VSOPEN_CLI-}" ]; then echo "$VSOPEN_CLI"; return 0; fi
+  mapfile -t cands < <(ls -d "$HOME"/.local/lib/code-server-*/lib/vscode/bin/remote-cli/code-server 2>/dev/null \
+                       | sort -rV || true)
+  cands+=(/usr/lib/code-server/lib/vscode/bin/remote-cli/code-server)
+  if bin=$(command -v code-server); then
+    bin=$(readlink -f "$bin")
+    cands+=("$bin")
+    d=$(dirname "$bin")
+    for _ in 1 2 3 4; do
+      cands+=("$d/lib/vscode/bin/remote-cli/code-server")
+      d=$(dirname "$d")
+    done
+  fi
+  for c in "${cands[@]}"; do
+    if [[ $c == */remote-cli/code-server && -x $c ]]; then echo "$c"; return 0; fi
+  done
+  return 1
+}
+if ! cli=$(find_cli); then
+  echo "vsopen: can't find code-server's remote CLI; set VSOPEN_CLI to <code-server>/lib/vscode/bin/remote-cli/code-server" >&2
+  exit 1
+fi
+
+err=""
+for sock in "${socks[@]:0:8}"; do
+  if err=$(VSCODE_IPC_HOOK_CLI="$sock" timeout 10 "$cli" -r "$@" 2>&1 >/dev/null); then
+    exit 0
+  fi
+done
+n=$(( ${#socks[@]} < 8 ? ${#socks[@]} : 8 ))
+echo "vsopen: none of the $n newest of ${#socks[@]} window sockets took the files; are the windows all closed?" >&2
+[ -z "$err" ] || echo "vsopen: last error: ${err:0:300}" >&2
+exit 1
